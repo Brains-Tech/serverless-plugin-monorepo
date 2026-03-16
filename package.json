@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "bun test",
     "lint:check": "yarn eslint . --ext .ts",
     "lint:format": "prettier -l 'src/**/*.ts'",
     "lint": "yarn lint:format && yarn lint:check"
@@ -46,6 +47,10 @@
   },
   "files": [
     "lib/index.js",
-    "src/index.ts"
+    "lib/pm-detect.js",
+    "lib/manifest.js",
+    "src/index.ts",
+    "src/pm-detect.ts",
+    "src/manifest.ts"
   ]
 }
