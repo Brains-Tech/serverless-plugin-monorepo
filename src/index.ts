@@ -1,6 +1,12 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import Serverless from 'serverless';
+import {
+  PackageManager,
+  detectPackageManager,
+  usesSymlinkStore,
+} from './pm-detect';
+import { readManifest, writeManifest, removeManifest } from './manifest';
 
 /** Takes a path and returns all node_modules resolution paths (but not global include paths). */
 function getNodeModulePaths(p: string): string[] {
@@ -28,12 +34,14 @@ async function link(target: string, f: string, type: fs.SymlinkType) {
 export interface ServerlessMonoRepoSettings {
   path: string;
   linkType: fs.SymlinkType;
+  packageManager?: PackageManager;
 }
 
 /** Plugin implementation */
-module.exports = class ServerlessMonoRepo {
+class ServerlessMonoRepo {
   settings: ServerlessMonoRepoSettings;
   hooks: { [key: string]: () => void };
+  packageManager: PackageManager;
 
   constructor(private serverless: Serverless) {
     this.hooks = {
@@ -54,6 +62,11 @@ module.exports = class ServerlessMonoRepo {
       path: custom.path ?? this.serverless.config.servicePath,
       linkType: custom.linkType ?? 'junction',
     };
+
+    // Detect package manager (setting override takes priority)
+    this.packageManager =
+      custom.packageManager ?? detectPackageManager(this.settings.path);
+    this.log(`Detected package manager: ${this.packageManager}`);
   }
 
   log(msg: string) {
@@ -80,12 +93,22 @@ module.exports = class ServerlessMonoRepo {
       paths,
     });
 
-    // Get relative path to package & create link if not an embedded node_modules
+    // Get relative path to package & create link if not an embedded node_modules.
+    // For bun/pnpm, the resolved path may go through .bun/ or .pnpm/ store which
+    // contains extra node_modules segments — count only real node_modules dirs.
     const target = path.relative(
       path.join(toPath, path.dirname(name)),
       path.dirname(pkg)
     );
-    if ((pkg.match(/node_modules/g) || []).length <= 1 && !created.has(name)) {
+    const nodeModulesCount = (
+      pkg.match(/node_modules/g) || []
+    ).length;
+    const isStoreResolved =
+      pkg.includes(`${path.sep}.bun${path.sep}`) ||
+      pkg.includes(`${path.sep}.pnpm${path.sep}`);
+    const maxDepth = isStoreResolved ? 2 : 1;
+
+    if (nodeModulesCount <= maxDepth && !created.has(name)) {
       created.add(name);
       await link(target, path.join(toPath, name), this.settings.linkType);
     }
@@ -108,16 +131,71 @@ module.exports = class ServerlessMonoRepo {
   }
 
   async clean() {
-    // Remove all symlinks that are of form [...]/node_modules/link
     this.log('Cleaning dependency symlinks');
 
+    const nodeModulesDir = path.join(this.settings.path, 'node_modules');
+
+    if (usesSymlinkStore(this.packageManager)) {
+      await this.cleanSelective(nodeModulesDir);
+    } else {
+      // Check if a manifest exists from a previous bun/pnpm run
+      const manifest = await readManifest(nodeModulesDir);
+      if (manifest.length > 0) {
+        await this.cleanSelective(nodeModulesDir);
+      } else {
+        await this.cleanAll(nodeModulesDir);
+      }
+    }
+  }
+
+  /** Selective clean: only remove symlinks listed in the manifest. */
+  private async cleanSelective(nodeModulesDir: string) {
+    const manifest = await readManifest(nodeModulesDir);
+    if (manifest.length === 0) {
+      this.log('No manifest found, skipping selective clean');
+      await removeManifest(nodeModulesDir);
+      return;
+    }
+
+    for (const name of manifest) {
+      const linkPath = path.join(nodeModulesDir, name);
+      try {
+        const stat = await fs.lstat(linkPath);
+        if (stat.isSymbolicLink()) {
+          await fs.unlink(linkPath);
+        }
+      } catch (e: any) {
+        if (e.code !== 'ENOENT') {
+          throw e;
+        }
+      }
+
+      // Clean up empty scoped package directories
+      if (name.startsWith('@')) {
+        const scopeDir = path.join(nodeModulesDir, name.split('/')[0]);
+        try {
+          const files = await fs.readdir(scopeDir);
+          if (files.length === 0) {
+            await fs.rmdir(scopeDir);
+          }
+        } catch (e: any) {
+          if (e.code !== 'ENOENT') {
+            throw e;
+          }
+        }
+      }
+    }
+
+    await removeManifest(nodeModulesDir);
+  }
+
+  /** Legacy clean: remove ALL symlinks from node_modules (npm/yarn behavior). */
+  private async cleanAll(p: string) {
     type File = { f: string; s: fs.Stats };
 
-    // Checks if a given stat result indicates a scoped package directory
     const isScopedPkgDir = (c: File) =>
       c.s.isDirectory() && c.f.startsWith('@');
 
-    // Cleans all links in a specific path
     async function clean(p: string) {
       if (!(await fs.pathExists(p))) {
         return;
@@ -149,8 +227,7 @@ module.exports = class ServerlessMonoRepo {
       }
     }
 
-    // Clean node_modules
-    await clean(path.join(this.settings.path, 'node_modules'));
+    await clean(p);
   }
 
   async initialise() {
@@ -162,17 +239,29 @@ module.exports = class ServerlessMonoRepo {
 
     // Link all dependent packages
     this.log('Creating dependency symlinks');
-    const contents = new Set<string>();
+    const created = new Set<string>();
     await Promise.all(
       Object.keys(dependencies).map((name) =>
         this.linkPackage(
           name,
           this.settings.path,
           path.join(this.settings.path, 'node_modules'),
-          contents,
+          created,
           []
         )
       )
     );
+
+    // Write manifest for bun/pnpm so clean() knows what to remove
+    const nodeModulesDir = path.join(this.settings.path, 'node_modules');
+    if (usesSymlinkStore(this.packageManager)) {
+      await writeManifest(nodeModulesDir, Array.from(created));
+    }
   }
-};
+}
+
+// CJS export for compiled output (tsc emits CommonJS)
+if (typeof module !== 'undefined') {
+  module.exports = ServerlessMonoRepo;
+}
+export default ServerlessMonoRepo;
