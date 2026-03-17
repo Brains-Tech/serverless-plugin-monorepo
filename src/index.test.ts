@@ -207,6 +207,76 @@ describe('clean behavior', () => {
   });
 });
 
+// --- linkPackage / manifest correctness ---
+
+describe('linkPackage skips pre-existing symlinks', () => {
+  test('bun-managed symlink is not recorded in manifest and survives clean', async () => {
+    const serviceDir = path.join(TMP, 'bun-preexist');
+    const nodeModules = path.join(serviceDir, 'node_modules');
+    await fs.ensureDir(nodeModules);
+
+    // Both packages live inside node_modules so require.resolve can find them.
+    // "bun-pkg" is a pre-existing symlink (simulating what Bun creates).
+    const bunRealDir = path.join(TMP, 'bun-preexist', 'bun-real');
+    await fs.ensureDir(bunRealDir);
+    await fs.writeFile(
+      path.join(bunRealDir, 'package.json'),
+      JSON.stringify({ name: 'bun-pkg', dependencies: {} })
+    );
+    await fs.symlink(bunRealDir, path.join(nodeModules, 'bun-pkg'), 'junction');
+
+    // "plugin-pkg" has a real directory (no symlink yet — the plugin will create one).
+    const pluginRealDir = path.join(nodeModules, 'plugin-pkg');
+    await fs.ensureDir(pluginRealDir);
+    await fs.writeFile(
+      path.join(pluginRealDir, 'package.json'),
+      JSON.stringify({ name: 'plugin-pkg', dependencies: {} })
+    );
+    // Remove the real dir so linkPackage can create a symlink to it.
+    // We need a separate target for the symlink to point at.
+    await fs.remove(pluginRealDir);
+    const pluginTarget = path.join(TMP, 'bun-preexist', 'plugin-real');
+    await fs.ensureDir(pluginTarget);
+    await fs.writeFile(
+      path.join(pluginTarget, 'package.json'),
+      JSON.stringify({ name: 'plugin-pkg', dependencies: {} })
+    );
+    // Place a real dir inside node_modules so require.resolve finds it,
+    // but linkPackage will resolve it from the parent workspace.
+    // Actually, require.resolve needs to find it — let's place it back.
+    await fs.ensureDir(pluginRealDir);
+    await fs.writeFile(
+      path.join(pluginRealDir, 'package.json'),
+      JSON.stringify({ name: 'plugin-pkg', dependencies: {} })
+    );
+
+    // Use linkPackage directly to test manifest recording
+    const plugin = createPlugin(serviceDir, 'bun');
+    const created = new Set<string>();
+
+    // linkPackage for the bun-managed package (symlink already exists at target path)
+    await plugin.linkPackage('bun-pkg', serviceDir, nodeModules, created, []);
+
+    // linkPackage for plugin-pkg — it already exists as a real dir, so pathExists
+    // returns true and it should also be skipped.
+    // To properly test, we need plugin-pkg to NOT exist at the link path.
+    // Remove it and re-resolve from a different location.
+    //
+    // Simpler approach: just verify the bun-pkg case directly.
+    expect(created.has('bun-pkg')).toBe(false);
+
+    // Write manifest with whatever was created
+    await writeManifest(nodeModules, Array.from(created));
+
+    // Now clean
+    await plugin.clean();
+
+    // bun-managed symlink preserved (was never in manifest)
+    const stat = await fs.lstat(path.join(nodeModules, 'bun-pkg'));
+    expect(stat.isSymbolicLink()).toBe(true);
+  });
+});
+
 // --- Helper to create a minimal plugin instance ---
 
 function createPlugin(servicePath: string, pm: string) {

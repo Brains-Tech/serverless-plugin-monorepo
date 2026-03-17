@@ -108,9 +108,13 @@ class ServerlessMonoRepo {
       pkg.includes(`${path.sep}.pnpm${path.sep}`);
     const maxDepth = isStoreResolved ? 2 : 1;
 
+    const linkPath = path.join(toPath, name);
     if (nodeModulesCount <= maxDepth && !created.has(name)) {
-      created.add(name);
-      await link(target, path.join(toPath, name), this.settings.linkType);
+      const alreadyExists = await fs.pathExists(linkPath);
+      if (!alreadyExists) {
+        created.add(name);
+        await link(target, linkPath, this.settings.linkType);
+      }
     }
 
     // Get dependencies
